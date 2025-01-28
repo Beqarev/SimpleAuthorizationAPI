@@ -2,71 +2,69 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Identity;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using TestAPI.Data;
-using TestAPI.DTOs;
-using TestAPI.Models;
 using LoginRequest = TestAPI.DTOs.LoginRequest;
 using RegisterRequest = TestAPI.DTOs.RegisterRequest;
 
 public class UserService
 {
     private readonly ApplicationDbContext _context;
-    private readonly IPasswordHasher<User> _passwordHasher;
+    private readonly UserManager<IdentityUser> _userManager;
     private readonly IConfiguration _configuration;
 
-    public UserService(ApplicationDbContext context, IPasswordHasher<User> passwordHasher, IConfiguration configuration)
+    public UserService(ApplicationDbContext context, UserManager<IdentityUser> userManager, IConfiguration configuration)
     {
         _context = context;
-        _passwordHasher = passwordHasher;
+        _userManager = userManager;
         _configuration = configuration;
     }
 
-    public async Task<AuthResponse> RegisterAsync(RegisterRequest request)
+    public async Task<IdentityResult> RegisterAsync(RegisterRequest request)
     {
-        if (await _context.Users.AnyAsync(u => u.Email == request.Email))
-            throw new Exception("Email already exists.");
-
-        var user = new User
+        IdentityUser? existingEmail = await _userManager.FindByEmailAsync(request.Email);
+        if (existingEmail != null)
         {
-            Email = request.Email,
-            PasswordHash = _passwordHasher.HashPassword(null, request.Password)
-        };
+            return IdentityResult.Failed(new IdentityError
+            {
+                Code = "DuplicateEmail",
+                Description = "The Email is already associated with another account"
+            });
+        }
 
-        _context.Users.Add(user);
-        await _context.SaveChangesAsync();
-        return new AuthResponse(){ Token = GenerateJwtToken(user)};
+        var user = new IdentityUser
+        {
+            UserName = request.Email,
+            Email = request.Email
+        };
+        IdentityResult result = await _userManager.CreateAsync(user, request.Password);
+
+        return result;
     }
 
-    public async Task<AuthResponse> LoginAsync(LoginRequest request)
+    public async Task<string> LoginAsync(LoginRequest request)
     {
-        var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
-
-        if (user == null || _passwordHasher.VerifyHashedPassword(null, user.PasswordHash, request.Password) != PasswordVerificationResult.Success)
-            throw new Exception("Invalid email or password.");
-
-        return new AuthResponse(){ Token = GenerateJwtToken(user)};
-    }
-    
-    private string GenerateJwtToken(User user)
-    {
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]));
-        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
-        var claims = new[]
+        IdentityUser? user = await _userManager.FindByEmailAsync(request.Email);
+        if (user != null && await _userManager.CheckPasswordAsync(user, request.Password))
         {
-            new Claim(ClaimTypes.Email, user.Email),
-            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString())
-        };
+            var userRoles = await _userManager.GetRolesAsync(user);
+            var authClaims = new List<Claim>
+            {
+                new("Id", user.Id),
+                new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new(JwtRegisteredClaimNames.Email, user.Email!)
+            };
+            authClaims.AddRange(userRoles.Select(role => new Claim(ClaimTypes.Role, role)));
 
-        var token = new JwtSecurityToken(
-            issuer: _configuration["Jwt:Issuer"],
-            audience: _configuration["Jwt:Audience"],
-            claims: claims,
-            expires: DateTime.UtcNow.AddHours(1),
-            signingCredentials: creds);
+            var token = new JwtSecurityToken(
+                issuer: _configuration["Jwt:Issuer"],
+                expires: DateTime.Now.AddMinutes(double.Parse(_configuration["Jwt:ExpiryMinutes"]!)),
+                claims: authClaims,
+                signingCredentials: new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:key"]!)),
+                    SecurityAlgorithms.HmacSha256));
 
-        return new JwtSecurityTokenHandler().WriteToken(token);
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+        throw new UnauthorizedAccessException("Invalid login attempt.");
     }
 }
